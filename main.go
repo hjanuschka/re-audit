@@ -49,13 +49,14 @@ type AuditReport struct {
 	Version           string             `json:"version"`
 	FromRef           string             `json:"from_ref,omitempty"`
 	ToRef             string             `json:"to_ref,omitempty"`
+	GitHubURL         string             `json:"github_url,omitempty"`
 	UnsafeBlocks      []UnsafeBlock      `json:"unsafe_blocks"`
 	SecurityPatterns  []SecurityPattern  `json:"security_patterns"`
 	DependencyChanges []DependencyChange `json:"dependency_changes"`
 	FileChanges       []FileChange       `json:"file_changes,omitempty"`
 	TotalUnsafeLines  int                `json:"total_unsafe_lines"`
 	FilesWithUnsafe   int                `json:"files_with_unsafe"`
-	RiskAssessment    string             `json:"risk_assessment"`
+	RiskAssessment    []string           `json:"risk_assessment"`
 	DiffStats         string             `json:"diff_stats,omitempty"`
 }
 
@@ -127,17 +128,49 @@ var unsafePatterns = []struct {
 }
 
 type Analyzer struct {
-	repoPath string
-	fromRef  string
-	toRef    string
+	repoPath  string
+	fromRef   string
+	toRef     string
+	githubURL string // e.g., "https://github.com/libjxl/jxl-rs"
 }
 
 func NewAnalyzer(repoPath, fromRef, toRef string) *Analyzer {
-	return &Analyzer{
+	a := &Analyzer{
 		repoPath: repoPath,
 		fromRef:  fromRef,
 		toRef:    toRef,
 	}
+	// Try to detect GitHub URL from git remote
+	a.githubURL = a.detectGitHubURL()
+	return a
+}
+
+func (a *Analyzer) detectGitHubURL() string {
+	out, err := a.git("remote", "get-url", "origin")
+	if err != nil {
+		return ""
+	}
+	url := strings.TrimSpace(out)
+	// Convert SSH to HTTPS format
+	if strings.HasPrefix(url, "git@github.com:") {
+		url = strings.Replace(url, "git@github.com:", "https://github.com/", 1)
+	}
+	// Remove .git suffix
+	url = strings.TrimSuffix(url, ".git")
+	// Only return if it's a GitHub URL
+	if strings.Contains(url, "github.com") {
+		return url
+	}
+	return ""
+}
+
+func (a *Analyzer) fileLink(file string, line int) string {
+	// Remove [TEST] suffix if present
+	cleanFile := strings.TrimSuffix(file, " [TEST]")
+	if a.githubURL != "" && a.toRef != "" {
+		return fmt.Sprintf("[`%s:%d`](%s/blob/%s/%s#L%d)", file, line, a.githubURL, a.toRef, cleanFile, line)
+	}
+	return fmt.Sprintf("`%s:%d`", file, line)
 }
 
 func (a *Analyzer) git(args ...string) (string, error) {
@@ -531,7 +564,7 @@ func (a *Analyzer) parseCargoDepsContent(content string) map[string]string {
 	return deps
 }
 
-func (a *Analyzer) assessRisk(report *AuditReport) string {
+func (a *Analyzer) assessRisk(report *AuditReport) []string {
 	var factors []string
 
 	// Count non-test unsafe (total and new)
@@ -550,7 +583,7 @@ func (a *Analyzer) assessRisk(report *AuditReport) string {
 	if prodUnsafe == 0 {
 		factors = append(factors, "✅ No unsafe code in production (ub-risk-0 candidate)")
 	} else if prodUnsafe <= 5 {
-		factors = append(factors, fmt.Sprintf("⚠️  %d unsafe blocks in production code", prodUnsafe))
+		factors = append(factors, fmt.Sprintf("⚠️ %d unsafe blocks in production code", prodUnsafe))
 	} else {
 		factors = append(factors, fmt.Sprintf("🔴 %d unsafe blocks in production code - thorough review needed", prodUnsafe))
 	}
@@ -560,7 +593,7 @@ func (a *Analyzer) assessRisk(report *AuditReport) string {
 	}
 
 	if testUnsafe > 0 {
-		factors = append(factors, fmt.Sprintf("ℹ️  %d unsafe blocks in test code (less critical)", testUnsafe))
+		factors = append(factors, fmt.Sprintf("ℹ️ %d unsafe blocks in test code (less critical)", testUnsafe))
 	}
 
 	// Check security patterns
@@ -576,39 +609,39 @@ func (a *Analyzer) assessRisk(report *AuditReport) string {
 	}
 
 	if patternTypes["fs"] {
-		marker := "⚠️ "
 		if newPatternTypes["fs"] {
-			marker = "🆕 "
+			factors = append(factors, "🆕 Filesystem access detected - verify safe-to-deploy")
+		} else {
+			factors = append(factors, "⚠️ Filesystem access detected - verify safe-to-deploy")
 		}
-		factors = append(factors, marker+"Filesystem access detected - verify safe-to-deploy")
 	}
 	if patternTypes["net"] {
-		marker := "⚠️ "
 		if newPatternTypes["net"] {
-			marker = "🆕 "
+			factors = append(factors, "🆕 Network access detected - verify safe-to-deploy")
+		} else {
+			factors = append(factors, "⚠️ Network access detected - verify safe-to-deploy")
 		}
-		factors = append(factors, marker+"Network access detected - verify safe-to-deploy")
 	}
 	if patternTypes["crypto"] {
-		marker := "🔐"
 		if newPatternTypes["crypto"] {
-			marker = "🆕"
+			factors = append(factors, "🆕 Crypto-related code detected - may need crypto-safe audit")
+		} else {
+			factors = append(factors, "🔐 Crypto-related code detected - may need crypto-safe audit")
 		}
-		factors = append(factors, marker+" Crypto-related code detected - may need crypto-safe audit")
 	}
 	if patternTypes["ffi"] {
-		marker := "⚠️ "
 		if newPatternTypes["ffi"] {
-			marker = "🆕 "
+			factors = append(factors, "🆕 FFI usage detected - review boundary safety")
+		} else {
+			factors = append(factors, "⚠️ FFI usage detected - review boundary safety")
 		}
-		factors = append(factors, marker+"FFI usage detected - review boundary safety")
 	}
 	if patternTypes["transmute"] {
-		marker := "🔴"
 		if newPatternTypes["transmute"] {
-			marker = "🆕"
+			factors = append(factors, "🆕 Transmute usage detected - careful review needed")
+		} else {
+			factors = append(factors, "🔴 Transmute usage detected - careful review needed")
 		}
-		factors = append(factors, marker+" Transmute usage detected - careful review needed")
 	}
 
 	// Dep changes
@@ -629,7 +662,7 @@ func (a *Analyzer) assessRisk(report *AuditReport) string {
 		}
 	}
 
-	return strings.Join(factors, "\n")
+	return factors
 }
 
 func (a *Analyzer) Analyze() (*AuditReport, error) {
@@ -640,6 +673,7 @@ func (a *Analyzer) Analyze() (*AuditReport, error) {
 		Version:   version,
 		FromRef:   a.fromRef,
 		ToRef:     a.toRef,
+		GitHubURL: a.githubURL,
 	}
 
 	// Get added lines for diff highlighting
@@ -688,7 +722,16 @@ func generateMarkdown(report *AuditReport) string {
 	sb.WriteString(fmt.Sprintf("# 🔍 Audit Report: %s v%s\n\n", report.CrateName, report.Version))
 
 	if report.FromRef != "" && report.ToRef != "" {
-		sb.WriteString(fmt.Sprintf("**Comparing:** `%s` → `%s`\n\n", report.FromRef, report.ToRef))
+		fromRef := report.FromRef
+		toRef := report.ToRef
+		if report.GitHubURL != "" {
+			fromRef = fmt.Sprintf("[`%s`](%s/tree/%s)", report.FromRef, report.GitHubURL, report.FromRef)
+			toRef = fmt.Sprintf("[`%s`](%s/tree/%s)", report.ToRef, report.GitHubURL, report.ToRef)
+		} else {
+			fromRef = fmt.Sprintf("`%s`", report.FromRef)
+			toRef = fmt.Sprintf("`%s`", report.ToRef)
+		}
+		sb.WriteString(fmt.Sprintf("**Comparing:** %s → %s\n\n", fromRef, toRef))
 	} else if report.FromRef != "" {
 		sb.WriteString(fmt.Sprintf("**Delta from:** `%s`\n\n", report.FromRef))
 	}
@@ -710,22 +753,110 @@ func generateMarkdown(report *AuditReport) string {
 		}
 	}
 
-	sb.WriteString("## Summary\n\n")
-	sb.WriteString("| Metric | Count |\n")
-	sb.WriteString("|--------|-------|\n")
-	sb.WriteString(fmt.Sprintf("| Unsafe blocks (production) | %d |\n", prodUnsafe))
-	if newProdUnsafe > 0 {
-		sb.WriteString(fmt.Sprintf("| **NEW unsafe blocks** | **%d** |\n", newProdUnsafe))
+	// Count new patterns
+	var newPatterns int
+	for _, p := range report.SecurityPatterns {
+		if p.IsNew && !strings.Contains(p.File, "[TEST]") {
+			newPatterns++
+		}
 	}
-	sb.WriteString(fmt.Sprintf("| Unsafe blocks (tests) | %d |\n", testUnsafe))
-	sb.WriteString(fmt.Sprintf("| Files with unsafe code | %d |\n", report.FilesWithUnsafe))
-	sb.WriteString(fmt.Sprintf("| Security-relevant patterns | %d |\n", len(report.SecurityPatterns)))
-	sb.WriteString(fmt.Sprintf("| Dependency changes | %d |\n", len(report.DependencyChanges)))
-	sb.WriteString(fmt.Sprintf("| Files changed | %d |\n\n", len(report.FileChanges)))
 
+	// Count new test unsafe
+	var newTestUnsafe int
+	for _, u := range report.UnsafeBlocks {
+		if u.IsNew && strings.Contains(u.File, "[TEST]") {
+			newTestUnsafe++
+		}
+	}
+
+	sb.WriteString("## Summary\n\n")
+	sb.WriteString("| Metric | Total | Delta |\n")
+	sb.WriteString("|--------|------:|:------|\n")
+
+	// Unsafe blocks (production)
+	if newProdUnsafe > 0 {
+		sb.WriteString(fmt.Sprintf("| Unsafe blocks (production) | %d | **+%d** 🆕 |\n", prodUnsafe, newProdUnsafe))
+	} else {
+		sb.WriteString(fmt.Sprintf("| Unsafe blocks (production) | %d | - |\n", prodUnsafe))
+	}
+
+	// Unsafe blocks (tests)
+	if newTestUnsafe > 0 {
+		sb.WriteString(fmt.Sprintf("| Unsafe blocks (tests) | %d | +%d |\n", testUnsafe, newTestUnsafe))
+	} else {
+		sb.WriteString(fmt.Sprintf("| Unsafe blocks (tests) | %d | - |\n", testUnsafe))
+	}
+
+	sb.WriteString(fmt.Sprintf("| Files with unsafe code | %d | - |\n", report.FilesWithUnsafe))
+
+	// Security patterns
+	if newPatterns > 0 {
+		sb.WriteString(fmt.Sprintf("| Security-relevant patterns | %d | +%d |\n", len(report.SecurityPatterns), newPatterns))
+	} else {
+		sb.WriteString(fmt.Sprintf("| Security-relevant patterns | %d | - |\n", len(report.SecurityPatterns)))
+	}
+
+	// Dependencies
+	if len(report.DependencyChanges) > 0 {
+		var added, removed, updated int
+		for _, d := range report.DependencyChanges {
+			switch d.ChangeType {
+			case "added":
+				added++
+			case "removed":
+				removed++
+			case "updated":
+				updated++
+			}
+		}
+		delta := ""
+		if added > 0 {
+			delta += fmt.Sprintf("+%d", added)
+		}
+		if removed > 0 {
+			if delta != "" {
+				delta += " "
+			}
+			delta += fmt.Sprintf("-%d", removed)
+		}
+		if updated > 0 {
+			if delta != "" {
+				delta += " "
+			}
+			delta += fmt.Sprintf("~%d", updated)
+		}
+		sb.WriteString(fmt.Sprintf("| Dependency changes | %d | %s |\n", len(report.DependencyChanges), delta))
+	} else {
+		sb.WriteString("| Dependency changes | 0 | - |\n")
+	}
+
+	// Files changed - parse from diff stats
+	if len(report.FileChanges) > 0 {
+		var totalAdd, totalDel int
+		for _, f := range report.FileChanges {
+			totalAdd += f.Additions
+			totalDel += f.Deletions
+		}
+		sb.WriteString(fmt.Sprintf("| Files changed | %d | +%d/-%d |\n", len(report.FileChanges), totalAdd, totalDel))
+	} else {
+		sb.WriteString("| Files changed | 0 | - |\n")
+	}
+	sb.WriteString("\n")
+
+	// Risk Assessment as a nice table
 	sb.WriteString("## Risk Assessment\n\n")
-	sb.WriteString(report.RiskAssessment)
-	sb.WriteString("\n\n")
+	sb.WriteString("| Status | Finding |\n")
+	sb.WriteString("|:------:|:--------|\n")
+	for _, factor := range report.RiskAssessment {
+		// Extract emoji and text
+		parts := strings.SplitN(factor, " ", 2)
+		if len(parts) == 2 {
+			sb.WriteString(fmt.Sprintf("| %s | %s |\n", parts[0], parts[1]))
+		} else {
+			sb.WriteString(fmt.Sprintf("| | %s |\n", factor))
+		}
+	}
+	sb.WriteString("\n")
 
 	// Cargo-vet suggestions
 	sb.WriteString("## Suggested cargo-vet Criteria\n\n")
@@ -756,6 +887,15 @@ func generateMarkdown(report *AuditReport) string {
 	}
 	sb.WriteString("\n")
 
+	// Helper to generate file links
+	fileLink := func(file string, line int) string {
+		cleanFile := strings.TrimSuffix(file, " [TEST]")
+		if report.GitHubURL != "" && report.ToRef != "" {
+			return fmt.Sprintf("[%s:%d](%s/blob/%s/%s#L%d)", file, line, report.GitHubURL, report.ToRef, cleanFile, line)
+		}
+		return fmt.Sprintf("%s:%d", file, line)
+	}
+
 	// NEW unsafe blocks first (most important for delta review)
 	newUnsafe := make([]UnsafeBlock, 0)
 	for _, block := range report.UnsafeBlocks {
@@ -769,7 +909,7 @@ func generateMarkdown(report *AuditReport) string {
 		sb.WriteString("These unsafe blocks were **added in this diff** and require careful review:\n\n")
 
 		for _, block := range newUnsafe {
-			sb.WriteString(fmt.Sprintf("### %s:%d (%s)\n", block.File, block.Line, block.BlockType))
+			sb.WriteString(fmt.Sprintf("### %s (`%s`)\n", fileLink(block.File, block.Line), block.BlockType))
 			sb.WriteString("```rust\n")
 			sb.WriteString(block.Context)
 			sb.WriteString("\n```\n\n")
@@ -795,7 +935,7 @@ func generateMarkdown(report *AuditReport) string {
 				marker = " 🆕"
 			}
 
-			sb.WriteString(fmt.Sprintf("### %s:%d (%s)%s\n", block.File, block.Line, block.BlockType, marker))
+			sb.WriteString(fmt.Sprintf("### %s (`%s`)%s\n", fileLink(block.File, block.Line), block.BlockType, marker))
 			sb.WriteString("```rust\n")
 			sb.WriteString(block.Context)
 			sb.WriteString("\n```\n\n")
@@ -860,7 +1000,7 @@ func generateMarkdown(report *AuditReport) string {
 				if p.IsNew {
 					marker = " 🆕"
 				}
-				sb.WriteString(fmt.Sprintf("- `%s:%d`: `%s`%s\n", p.File, p.Line, code, marker))
+				sb.WriteString(fmt.Sprintf("- %s: `%s`%s\n", fileLink(p.File, p.Line), code, marker))
 			}
 			sb.WriteString("\n")
 		}
