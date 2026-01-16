@@ -162,8 +162,8 @@ func (a *Analyzer) getChangedFiles() ([]FileChange, error) {
 		return nil, nil
 	}
 
-	// Get diff stats
-	out, err := a.git("diff", "--numstat", a.fromRef, a.toRef, "--", "*.rs", "Cargo.toml", "Cargo.lock")
+	// Get diff stats using diff-tree to bypass external diff tools
+	out, err := a.git("diff-tree", "--numstat", "-r", a.fromRef, a.toRef, "--", "*.rs", "Cargo.toml", "Cargo.lock")
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +203,7 @@ func (a *Analyzer) getDiffStats() string {
 		return ""
 	}
 
-	out, _ := a.git("diff", "--stat", a.fromRef, a.toRef, "--", "*.rs")
+	out, _ := a.git("diff-tree", "--stat", "-r", a.fromRef, a.toRef, "--", "*.rs")
 	lines := strings.Split(out, "\n")
 	if len(lines) > 0 {
 		return lines[len(lines)-1] // Summary line
@@ -217,7 +217,8 @@ func (a *Analyzer) getAddedLines() (map[string]map[int]bool, error) {
 	}
 
 	// Get unified diff to find which lines are new
-	out, err := a.git("diff", "-U0", a.fromRef, a.toRef, "--", "*.rs")
+	// Use diff-tree to bypass any external diff tools configured
+	out, err := a.git("diff-tree", "-p", "-U0", a.fromRef, a.toRef, "--", "*.rs")
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +254,21 @@ func (a *Analyzer) getAddedLines() (map[string]map[int]bool, error) {
 }
 
 func (a *Analyzer) findRustFiles() ([]string, error) {
+	// If we have a toRef, use git ls-tree to get files at that ref
+	if a.toRef != "" {
+		out, err := a.git("ls-tree", "-r", "--name-only", a.toRef)
+		if err == nil {
+			var files []string
+			for _, f := range strings.Split(out, "\n") {
+				if strings.HasSuffix(f, ".rs") && !strings.Contains(f, "target/") {
+					files = append(files, f)
+				}
+			}
+			return files, nil
+		}
+	}
+
+	// Fall back to filesystem walk
 	var files []string
 	err := filepath.WalkDir(a.repoPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -269,13 +285,27 @@ func (a *Analyzer) findRustFiles() ([]string, error) {
 	return files, err
 }
 
-func (a *Analyzer) analyzeFile(filePath string, addedLines map[string]map[int]bool) ([]UnsafeBlock, []SecurityPattern, error) {
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, nil, err
+func (a *Analyzer) analyzeFile(filePath string, addedLines map[string]map[int]bool, useGit bool) ([]UnsafeBlock, []SecurityPattern, error) {
+	var content []byte
+	var relPath string
+
+	if useGit && a.toRef != "" {
+		// filePath is already a relative path from git ls-tree
+		relPath = filePath
+		contentStr, err := a.getFileAtRef(a.toRef, filePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		content = []byte(contentStr)
+	} else {
+		var err error
+		content, err = os.ReadFile(filePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		relPath, _ = filepath.Rel(a.repoPath, filePath)
 	}
 
-	relPath, _ := filepath.Rel(a.repoPath, filePath)
 	lines := strings.Split(string(content), "\n")
 	isTestFile := strings.Contains(relPath, "/tests/") ||
 		strings.HasSuffix(relPath, "_test.rs") ||
@@ -350,6 +380,28 @@ func (a *Analyzer) analyzeFile(filePath string, addedLines map[string]map[int]bo
 }
 
 func (a *Analyzer) getCrateInfo() (name, version string) {
+	// First try to get from git at toRef
+	if a.toRef != "" {
+		content, err := a.getFileAtRef(a.toRef, "Cargo.toml")
+		if err == nil {
+			name, version = a.parseCrateInfo(content)
+			if name != "unknown" {
+				return
+			}
+		}
+		// Try workspace members
+		for _, subdir := range []string{"jxl", "jxl_simd", "src", "lib", "crate"} {
+			content, err := a.getFileAtRef(a.toRef, subdir+"/Cargo.toml")
+			if err == nil {
+				name, version = a.parseCrateInfo(content)
+				if name != "unknown" {
+					return
+				}
+			}
+		}
+	}
+
+	// Fall back to filesystem
 	cargoPath := filepath.Join(a.repoPath, "Cargo.toml")
 	content, err := os.ReadFile(cargoPath)
 	if err != nil {
@@ -366,17 +418,21 @@ func (a *Analyzer) getCrateInfo() (name, version string) {
 		}
 	}
 
+	return a.parseCrateInfo(string(content))
+}
+
+func (a *Analyzer) parseCrateInfo(content string) (name, version string) {
 	nameRe := regexp.MustCompile(`(?m)^name\s*=\s*"([^"]+)"`)
 	versionRe := regexp.MustCompile(`(?m)^version\s*=\s*"([^"]+)"`)
 
-	if m := nameRe.FindSubmatch(content); m != nil {
-		name = string(m[1])
+	if m := nameRe.FindStringSubmatch(content); m != nil {
+		name = m[1]
 	} else {
 		name = "unknown"
 	}
 
-	if m := versionRe.FindSubmatch(content); m != nil {
-		version = string(m[1])
+	if m := versionRe.FindStringSubmatch(content); m != nil {
+		version = m[1]
 	} else {
 		version = "unknown"
 	}
@@ -599,10 +655,13 @@ func (a *Analyzer) Analyze() (*AuditReport, error) {
 		return nil, err
 	}
 
+	// Determine if we're using git refs or filesystem
+	useGit := a.toRef != "" && len(files) > 0 && !strings.HasPrefix(files[0], "/")
+
 	filesWithUnsafe := make(map[string]bool)
 
 	for _, f := range files {
-		unsafeBlocks, secPatterns, err := a.analyzeFile(f, addedLines)
+		unsafeBlocks, secPatterns, err := a.analyzeFile(f, addedLines, useGit)
 		if err != nil {
 			continue
 		}
