@@ -566,12 +566,16 @@ func (a *Analyzer) parseCargoDepsContent(content string) map[string]string {
 
 func (a *Analyzer) assessRisk(report *AuditReport) []string {
 	var factors []string
+	isDelta := report.FromRef != ""
 
 	// Count non-test unsafe (total and new)
-	var prodUnsafe, testUnsafe, newProdUnsafe int
+	var prodUnsafe, testUnsafe, newProdUnsafe, newTestUnsafe int
 	for _, u := range report.UnsafeBlocks {
 		if strings.Contains(u.File, "[TEST]") {
 			testUnsafe++
+			if u.IsNew {
+				newTestUnsafe++
+			}
 		} else {
 			prodUnsafe++
 			if u.IsNew {
@@ -580,71 +584,91 @@ func (a *Analyzer) assessRisk(report *AuditReport) []string {
 		}
 	}
 
-	if prodUnsafe == 0 {
-		factors = append(factors, "✅ No unsafe code in production (ub-risk-0 candidate)")
-	} else if prodUnsafe <= 5 {
-		factors = append(factors, fmt.Sprintf("⚠️ %d unsafe blocks in production code", prodUnsafe))
-	} else {
-		factors = append(factors, fmt.Sprintf("🔴 %d unsafe blocks in production code - thorough review needed", prodUnsafe))
-	}
-
-	if newProdUnsafe > 0 {
-		factors = append(factors, fmt.Sprintf("🆕 %d NEW unsafe blocks added in this diff", newProdUnsafe))
-	}
-
-	if testUnsafe > 0 {
-		factors = append(factors, fmt.Sprintf("ℹ️ %d unsafe blocks in test code (less critical)", testUnsafe))
-	}
-
 	// Check security patterns
-	patternTypes := make(map[string]bool)
-	newPatternTypes := make(map[string]bool)
+	patternTypes := make(map[string]int)
+	newPatternTypes := make(map[string]int)
 	for _, p := range report.SecurityPatterns {
 		if !strings.Contains(p.File, "[TEST]") {
-			patternTypes[p.PatternType] = true
+			patternTypes[p.PatternType]++
 			if p.IsNew {
-				newPatternTypes[p.PatternType] = true
+				newPatternTypes[p.PatternType]++
 			}
 		}
 	}
 
-	if patternTypes["fs"] {
-		if newPatternTypes["fs"] {
-			factors = append(factors, "🆕 Filesystem access detected - verify safe-to-deploy")
+	if isDelta {
+		// Delta mode: focus on what's NEW
+		if newProdUnsafe == 0 {
+			factors = append(factors, "✅ No new unsafe code added")
+		} else if newProdUnsafe <= 5 {
+			factors = append(factors, fmt.Sprintf("⚠️ %d new unsafe blocks to review", newProdUnsafe))
+		} else if newProdUnsafe <= 20 {
+			factors = append(factors, fmt.Sprintf("🔴 %d new unsafe blocks to review - moderate effort", newProdUnsafe))
 		} else {
+			factors = append(factors, fmt.Sprintf("🔴 %d new unsafe blocks to review - significant effort", newProdUnsafe))
+		}
+
+		if newTestUnsafe > 0 {
+			factors = append(factors, fmt.Sprintf("ℹ️ %d new unsafe blocks in tests (lower priority)", newTestUnsafe))
+		}
+
+		// Only report NEW patterns
+		if newPatternTypes["fs"] > 0 {
+			factors = append(factors, fmt.Sprintf("🆕 +%d new filesystem access patterns", newPatternTypes["fs"]))
+		}
+		if newPatternTypes["net"] > 0 {
+			factors = append(factors, fmt.Sprintf("🆕 +%d new network access patterns", newPatternTypes["net"]))
+		}
+		if newPatternTypes["crypto"] > 0 {
+			factors = append(factors, fmt.Sprintf("🆕 +%d new crypto-related patterns - may need crypto-safe audit", newPatternTypes["crypto"]))
+		}
+		if newPatternTypes["ffi"] > 0 {
+			factors = append(factors, fmt.Sprintf("🆕 +%d new FFI patterns - review boundary safety", newPatternTypes["ffi"]))
+		}
+		if newPatternTypes["transmute"] > 0 {
+			factors = append(factors, fmt.Sprintf("🔴 +%d new transmute usages - careful review needed", newPatternTypes["transmute"]))
+		}
+		if newPatternTypes["raw_ptr"] > 0 {
+			factors = append(factors, fmt.Sprintf("⚠️ +%d new raw pointer operations", newPatternTypes["raw_ptr"]))
+		}
+
+		// Context: mention existing unsafe for reference
+		existingUnsafe := prodUnsafe - newProdUnsafe
+		if existingUnsafe > 0 {
+			factors = append(factors, fmt.Sprintf("ℹ️ %d existing unsafe blocks (already audited in %s)", existingUnsafe, report.FromRef))
+		}
+	} else {
+		// Full audit mode (no base ref)
+		if prodUnsafe == 0 {
+			factors = append(factors, "✅ No unsafe code in production (ub-risk-0 candidate)")
+		} else if prodUnsafe <= 5 {
+			factors = append(factors, fmt.Sprintf("⚠️ %d unsafe blocks in production code", prodUnsafe))
+		} else {
+			factors = append(factors, fmt.Sprintf("🔴 %d unsafe blocks in production code - thorough review needed", prodUnsafe))
+		}
+
+		if testUnsafe > 0 {
+			factors = append(factors, fmt.Sprintf("ℹ️ %d unsafe blocks in test code (less critical)", testUnsafe))
+		}
+
+		if patternTypes["fs"] > 0 {
 			factors = append(factors, "⚠️ Filesystem access detected - verify safe-to-deploy")
 		}
-	}
-	if patternTypes["net"] {
-		if newPatternTypes["net"] {
-			factors = append(factors, "🆕 Network access detected - verify safe-to-deploy")
-		} else {
+		if patternTypes["net"] > 0 {
 			factors = append(factors, "⚠️ Network access detected - verify safe-to-deploy")
 		}
-	}
-	if patternTypes["crypto"] {
-		if newPatternTypes["crypto"] {
-			factors = append(factors, "🆕 Crypto-related code detected - may need crypto-safe audit")
-		} else {
+		if patternTypes["crypto"] > 0 {
 			factors = append(factors, "🔐 Crypto-related code detected - may need crypto-safe audit")
 		}
-	}
-	if patternTypes["ffi"] {
-		if newPatternTypes["ffi"] {
-			factors = append(factors, "🆕 FFI usage detected - review boundary safety")
-		} else {
+		if patternTypes["ffi"] > 0 {
 			factors = append(factors, "⚠️ FFI usage detected - review boundary safety")
 		}
-	}
-	if patternTypes["transmute"] {
-		if newPatternTypes["transmute"] {
-			factors = append(factors, "🆕 Transmute usage detected - careful review needed")
-		} else {
+		if patternTypes["transmute"] > 0 {
 			factors = append(factors, "🔴 Transmute usage detected - careful review needed")
 		}
 	}
 
-	// Dep changes
+	// Dep changes (always relevant)
 	if len(report.DependencyChanges) > 0 {
 		var added, updated int
 		for _, d := range report.DependencyChanges {
@@ -655,10 +679,10 @@ func (a *Analyzer) assessRisk(report *AuditReport) []string {
 			}
 		}
 		if added > 0 {
-			factors = append(factors, fmt.Sprintf("📦 %d new dependencies added - review their audits", added))
+			factors = append(factors, fmt.Sprintf("📦 %d new dependencies added - verify their audits", added))
 		}
 		if updated > 0 {
-			factors = append(factors, fmt.Sprintf("📦 %d dependencies updated", updated))
+			factors = append(factors, fmt.Sprintf("📦 %d dependencies updated - check for delta audits", updated))
 		}
 	}
 
@@ -844,9 +868,14 @@ func generateMarkdown(report *AuditReport) string {
 	sb.WriteString("\n")
 
 	// Risk Assessment as a nice table
-	sb.WriteString("## Risk Assessment\n\n")
-	sb.WriteString("| Status | Finding |\n")
-	sb.WriteString("|:------:|:--------|\n")
+	if report.FromRef != "" {
+		sb.WriteString("## 📋 Delta Review Assessment\n\n")
+		sb.WriteString(fmt.Sprintf("> Assuming `%s` was already audited. Showing only **new changes** to review.\n\n", report.FromRef))
+	} else {
+		sb.WriteString("## Risk Assessment\n\n")
+	}
+	sb.WriteString("| | Finding |\n")
+	sb.WriteString("|:--:|:--------|\n")
 	for _, factor := range report.RiskAssessment {
 		// Extract emoji and text
 		parts := strings.SplitN(factor, " ", 2)
